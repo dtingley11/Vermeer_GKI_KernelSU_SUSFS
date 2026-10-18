@@ -428,22 +428,28 @@ jobs:
       - name: Android 13/14/15 boot image build script
         run: |
           cd "$CONFIG/bootimgs"
+          signing_args=(--algorithm NONE)
+          if [ -n "${BOOT_SIGN_KEY_PATH:-}" ]; then
+            signing_args=(--algorithm SHA256_RSA2048 --key "$BOOT_SIGN_KEY_PATH")
+          else
+            echo "No custom signing key; generating unsigned AVB metadata for build diagnostics."
+          fi
           # Create gzip of the Image file
           gzip -n -k -f -9 ./Image > ./Image.gz
           
           echo "Building boot.img"
           $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img "${signing_args[@]}"
           cp ./boot.img "../KSUN-$KSUVER-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot.img"
           
           echo "Building boot-gz.img"
           $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img "${signing_args[@]}"
           cp ./boot-gz.img "../KSUN-$KSUVER-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-gz.img"
           
           echo "Building boot-lz4.img"
           $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img "${signing_args[@]}"
           cp ./boot-lz4.img "../KSUN-$KSUVER-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-boot-lz4.img"
 
       - name: Compress all img files with gzip
