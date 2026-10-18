@@ -1,4 +1,4 @@
-name: Build Kernel - Android 13 5.15 KSUN 2.0
+name: Build Kernel - Android 13 5.15 KSUN 2.0 (pershoot dev-susfs)
 
 permissions:
   contents: write
@@ -33,10 +33,10 @@ on:
         type: string
         default: "2023-11"
       kernelsu_branch:
-        description: 'KernelSU branch or hash (dev, legacy, stable or hash)'
+        description: 'pershoot/KernelSU-Next branch or hash (dev-susfs or hash)'
         required: true
         type: string
-        default: "dev"
+        default: "dev-susfs"
       susfs_branch:
         description: 'SusFS branch or hash (gki-android13-5.15 or hash)'
         required: true
@@ -63,7 +63,7 @@ on:
       kernelsu_branch:
         required: true
         type: string
-        default: "dev"
+        default: "dev-susfs"
       susfs_branch:
         required: true
         type: string
@@ -136,7 +136,6 @@ jobs:
           echo "MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" >> $GITHUB_ENV
           echo "UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py" >> $GITHUB_ENV
 
-  
       - name: Set boot sign key
         env:
           BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
@@ -187,12 +186,26 @@ jobs:
             exit 1
           fi
 
+          # Pershoot's SUSFS fixes, cherry-picked onto the SUSFS checkout for
+          # KernelSU-Next (the same two commits the WildKernels GKI repo applies
+          # to every next build; they touch only kernel_patches/fs/susfs.c):
+          #   6387756 fs/susfs: Allow core to be built with no features
+          #   161c058 fs/susfs: Implement SuSFS and Toolkit coexistence
+          # Fail loud: a failed pick must kill the job, never march on.
+          git config user.email "ci@localhost"
+          git config user.name "CI"
+          git fetch https://gitlab.com/pershoot/susfs4ksu.git \
+            6387756d64b3ab9ececefc4523627a9ee05a7519 \
+            161c058fed5544a6573d87124f346dadd5c4962d
+          git cherry-pick 6387756d64b3ab9ececefc4523627a9ee05a7519
+          git cherry-pick 161c058fed5544a6573d87124f346dadd5c4962d
+
       - name: Initialize and Sync Kernel Source
         run: |
           mkdir -p "$CONFIG"
           cd "$CONFIG"
           FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
-          $REPO init --depth=1 --u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16
+          $REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16
           REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
           DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
           if grep -q deprecated <<< $REMOTE_BRANCH; then
@@ -202,11 +215,24 @@ jobs:
           $REPO --version
           $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
 
-      - name: Add KernelSU Next
+      - name: Add KernelSU Next (pershoot dev-susfs)
+        env:
+          KERNELSU_BRANCH: ${{ inputs.kernelsu_branch }}
         run: |
           cd "$CONFIG"
-          echo "Adding KernelSU Next..."
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/stable/kernel/setup.sh" | bash -s "${{ inputs.kernelsu_branch }}"
+          echo "Adding KernelSU Next from pershoot's fork..."
+          # Same source the WildKernels GKI repo uses for KernelSU-Next + SUSFS:
+          # pershoot/KernelSU-Next dev-susfs tip. His setup.sh self-references
+          # the fork and wires drivers/kernelsu (symlink + Makefile + Kconfig).
+          setup_script=$(mktemp "$RUNNER_TEMP/kernelsu-setup.XXXXXX.sh")
+          trap 'rm -f "$setup_script"' EXIT
+          curl --fail --location --show-error --silent \
+            --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
+            "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" \
+            --output "$setup_script"
+          bash "$setup_script" "$KERNELSU_BRANCH"
+          echo "KSUN_COMMIT=$(git -C ./KernelSU-Next rev-parse HEAD)" >> $GITHUB_ENV
+          echo "KernelSU-Next (pershoot) commit: $(git -C ./KernelSU-Next rev-parse HEAD)"
 
       - name: Apply SUSFS Patches for KernelSU Next
         run: |
@@ -217,42 +243,72 @@ jobs:
           
           cd common
           
-          # Fake kernel patch to fix failures
-          fake_patched=0
-          if [ "${{ inputs.android_version }}" = "android13" ] && [ "${{ inputs.kernel_version }}" = "5.15" ]; then
-            if ! grep -qxF $'\tif (!vma_pages(vma))' ./fs/proc/task_mmu.c; then
-              echo "vma_pages Line not found. Fake Patching!"
-              fake_patched=1
-            fi
+          susfs_patch="50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch"
+          if [ "${{ inputs.android_version }}-${{ inputs.kernel_version }}" = "android13-5.15" ]; then
+            # Newer SUSFS patches include context from later Android 13 kernels.
+            # Adapt only the known differences; retain all SUSFS additions.
+            python3 - "$susfs_patch" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          patch = Path(sys.argv[1])
+          sections = re.split(r"(?=^diff --git )", patch.read_text(), flags=re.M)
+          for index, section in enumerate(sections):
+              target = re.search(r"^--- a/(.+)$", section, re.M)
+              if not target or target[1] not in ("fs/namespace.c", "fs/proc/task_mmu.c"):
+                  continue
+              source = Path(target[1]).read_text()
+              trace_header = ("#include <trace/hooks/blk.h>" if target[1] == "fs/namespace.c"
+                              else "#include <trace/hooks/mm.h>")
+              if trace_header not in source.splitlines():
+                  section = section.replace(" " + trace_header + "\n", "")
+              if target[1] == "fs/proc/task_mmu.c":
+                  if "\tif (!vma_pages(vma))" not in source.splitlines():
+                      section = section.replace(" \tif (!vma_pages(vma))\n",
+                                                " \tsmap_gather_stats(vma, &mss, 0);\n")
+                  # Older kernels have no VMA padding; their mapping ends at vm_end.
+                  # Preserve the native helper on kernels that do support padding.
+                  section = section.replace(
+                      "+\t\t\t\tend = VMA_PAD_START(vma);\n",
+                      "+#ifdef VMA_PAD_START\n"
+                      "+\t\t\t\tend = VMA_PAD_START(vma);\n"
+                      "+#else\n"
+                      "+\t\t\t\tend = vma->vm_end;\n"
+                      "+#endif\n")
+              # Recount edited hunks so patch still validates their full contents.
+              hunks = re.split(r"(?=^@@ )", section, flags=re.M)
+              for hunk_index in range(1, len(hunks)):
+                  header, body = hunks[hunk_index].split("\n", 1)
+                  match = re.fullmatch(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)", header)
+                  if not match:
+                      raise SystemExit(f"Unexpected patch header: {header}")
+                  lines = body.splitlines()
+                  old_count = sum(line.startswith((" ", "-")) for line in lines)
+                  new_count = sum(line.startswith((" ", "+")) for line in lines)
+                  hunks[hunk_index] = (f"@@ -{match[1]},{old_count} +{match[2]},{new_count} @@{match[3]}\n" + body)
+              sections[index] = "".join(hunks)
+          patch.write_text("".join(sections))
+          PY
           fi
-          
-          patch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch || true
-          
-          # Revert Fake kernel patch
-          if [ "$fake_patched" = 1 ]; then
-            if [ "${{ inputs.android_version }}" = "android13" ] && [ "${{ inputs.kernel_version }}" = "5.15" ]; then
-              if grep -qxF $'\t\t\tgoto show_pad;' ./fs/proc/task_mmu.c; then
-                echo "vma_pages Line found. Revert Fake Patching!"
-                sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
-              fi
-            fi
-          fi
-          
+
+          # Reject incompatible patches before changing the kernel sources.
+          patch --dry-run --batch --forward -p1 < "$susfs_patch"
+          patch --batch --forward -p1 < "$susfs_patch"
           
           cd ..
-          echo "Applying SUSFS patches for KernelSU Next..."
-          cd ./KernelSU-Next
-          cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
-          patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
-          
-          for file in $(find ./kernel -maxdepth 2 -name "*.rej" -exec basename {} .rej \;); do
-            echo "Patching file: $file with fix_$file.patch"
-            patch -p1 --forward < "../../kernel_patches/next/susfs_fix_patches/v2.2.0/fix_$file.patch"
-          done
-          echo "Patching Hook Mode!"
-          patch -p1 --forward < "../../kernel_patches/next/susfs_fix_patches/v2.2.0/overwrite_hook_mode.patch" || true
-          echo "Patching KSU_TOOLKIT Support for SusFS kernel!"
-          patch -p1 --forward < "../../kernel_patches/next/susfs_fix_patches/v2.2.0/ksu_toolkit.patch"
+          # pershoot's dev-susfs tree already ships SUSFS integrated (same as the
+          # WildKernels GKI repo treats next): no 10_enable_susfs_for_ksu.patch
+          # and no susfs_fix_patches / overwrite_hook_mode / ksu_toolkit patches
+          # are applied to the root tree.
+          echo "KernelSU-Next (pershoot) ships SUSFS - skipping KSU-side susfs patches."
+          # Soften the Kbuild config guard (same as the GKI repo): at parse time
+          # without a .config it would hard-error before defconfig sets
+          # CONFIG_KSU_SUSFS=y. No-op if upstream drops the guard.
+          if [ -f ./KernelSU-Next/kernel/Kbuild ] && grep -q 'KernelSU requires either CONFIG_KPROBES' ./KernelSU-Next/kernel/Kbuild; then
+            sed -i 's/$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/$(warning "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/' ./KernelSU-Next/kernel/Kbuild
+            echo "Softened KSU config guard in KernelSU-Next/kernel/Kbuild"
+          fi
 
       - name: Add Configuration Settings
         run: |
@@ -273,6 +329,7 @@ jobs:
           echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
